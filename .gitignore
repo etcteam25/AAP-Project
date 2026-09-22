@@ -1,4 +1,0 @@
-*.retry
-.env
-*.pem
-*.key
