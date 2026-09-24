@@ -1,0 +1,95 @@
+---
+- name: Validate Dell server storage layout
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    idrac_validate_certs: false
+    idrac_username: "{{ lookup('ansible.builtin.env', 'IDRAC_USERNAME') }}"
+    idrac_password: "{{ lookup('ansible.builtin.env', 'IDRAC_PASSWORD') }}"
+
+  tasks:
+    - name: Validate required input
+      ansible.builtin.assert:
+        that:
+          - idrac_ip is defined
+          - idrac_ip | string | length > 0
+          - storage_profile is defined
+          - storage_profile in ['standalone_nvme', 'raid1']
+        fail_msg: "Provide idrac_ip and a valid storage_profile."
+
+    - name: Gather storage facts from iDRAC
+      ansible.builtin.include_role:
+        name: dellemc.openmanage.idrac_gather_facts
+      vars:
+        hostname: "{{ idrac_ip }}"
+        username: "{{ idrac_username }}"
+        password: "{{ idrac_password }}"
+        validate_certs: "{{ idrac_validate_certs }}"
+        target:
+          - System
+          - Controller
+          - PhysicalDisk
+          - VirtualDisk
+
+    - name: Normalize discovered facts
+      ansible.builtin.set_fact:
+        discovered_controllers: "{{ controller | default([]) }}"
+        discovered_physical_disks: "{{ physical_disk | default([]) }}"
+        discovered_virtual_disks: "{{ virtual_disk | default([]) }}"
+
+    - name: Show discovered storage summary
+      ansible.builtin.debug:
+        msg:
+          - "Requested profile: {{ storage_profile }}"
+          - "Controllers found: {{ discovered_controllers | length }}"
+          - "Physical disks found: {{ discovered_physical_disks | length }}"
+          - "Virtual disks found: {{ discovered_virtual_disks | length }}"
+
+    - name: Validate standalone NVMe profile
+      when: storage_profile == 'standalone_nvme'
+      ansible.builtin.assert:
+        that:
+          - discovered_physical_disks | length > 0
+          - discovered_controllers | length == 0
+        success_msg: "Standalone NVMe storage validation PASSED."
+        fail_msg: >-
+          Standalone NVMe validation FAILED.
+          Expected physical disks with no RAID controller.
+
+    - name: Validate RAID1 profile - basic discovery
+      when: storage_profile == 'raid1'
+      ansible.builtin.assert:
+        that:
+          - discovered_controllers | length > 0
+          - discovered_physical_disks | length >= 2
+          - discovered_virtual_disks | length > 0
+        success_msg: "Basic RAID storage discovery PASSED."
+        fail_msg: >-
+          RAID1 validation FAILED.
+          Expected a RAID controller, at least two physical disks,
+          and at least one virtual disk.
+
+    - name: Show physical disk IDs
+      ansible.builtin.debug:
+        msg: >-
+          Disk={{ item.Id | default('UNKNOWN') }}
+          Model={{ item.Model | default('UNKNOWN') }}
+          Serial={{ item.SerialNumber | default('UNKNOWN') }}
+          Capacity={{ item.CapacityBytes | default('UNKNOWN') }}
+          FailurePredicted={{ item.FailurePredicted | default('UNKNOWN') }}
+      loop: "{{ discovered_physical_disks }}"
+
+    - name: Show virtual disk IDs
+      ansible.builtin.debug:
+        msg: >-
+          VirtualDisk={{ item.Id | default('UNKNOWN') }}
+          Name={{ item.Name | default('UNKNOWN') }}
+          Capacity={{ item.CapacityBytes | default('UNKNOWN') }}
+      loop: "{{ discovered_virtual_disks }}"
+
+    - name: Final validation result
+      ansible.builtin.debug:
+        msg: "Storage validation completed successfully for {{ idrac_ip }}."
