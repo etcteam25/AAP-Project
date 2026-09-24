@@ -59,4 +59,4 @@
 
     - name: Show host NIC information
       ansible.builtin.debug:
-        var: host_nic
+        var: hostnic
