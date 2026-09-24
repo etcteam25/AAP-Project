@@ -1,0 +1,92 @@
+---
+- name: Select Dell installation target
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    idrac_validate_certs: false
+    idrac_username: "{{ lookup('ansible.builtin.env', 'IDRAC_USERNAME') }}"
+    idrac_password: "{{ lookup('ansible.builtin.env', 'IDRAC_PASSWORD') }}"
+
+  tasks:
+    - name: Validate required input
+      ansible.builtin.assert:
+        that:
+          - idrac_ip is defined
+          - storage_profile is defined
+          - install_disk_selector is defined
+          - storage_profile in ['standalone_nvme', 'raid1']
+          - install_disk_selector in ['disk0', 'disk1', 'raid_virtual_disk']
+        fail_msg: "Provide idrac_ip, storage_profile and install_disk_selector."
+
+    - name: Gather Dell storage facts
+      ansible.builtin.include_role:
+        name: dellemc.openmanage.idrac_gather_facts
+      vars:
+        hostname: "{{ idrac_ip }}"
+        username: "{{ idrac_username }}"
+        password: "{{ idrac_password }}"
+        validate_certs: "{{ idrac_validate_certs }}"
+        target:
+          - Controller
+          - PhysicalDisk
+          - VirtualDisk
+
+    - name: Normalize discovered facts
+      ansible.builtin.set_fact:
+        discovered_controllers: "{{ controller | default([]) }}"
+        discovered_physical_disks: "{{ physical_disk | default([]) }}"
+        discovered_virtual_disks: "{{ virtual_disk | default([]) }}"
+
+    - name: Select standalone Disk 0
+      ansible.builtin.set_fact:
+        selected_install_disk: "{{ item }}"
+      loop: "{{ discovered_physical_disks }}"
+      when:
+        - storage_profile == 'standalone_nvme'
+        - install_disk_selector == 'disk0'
+        - item.Id is search('-0$')
+
+    - name: Select standalone Disk 1
+      ansible.builtin.set_fact:
+        selected_install_disk: "{{ item }}"
+      loop: "{{ discovered_physical_disks }}"
+      when:
+        - storage_profile == 'standalone_nvme'
+        - install_disk_selector == 'disk1'
+        - item.Id is search('-1$')
+
+    - name: Stop RAID target selection until RAID hardware is discovered
+      ansible.builtin.fail:
+        msg: >-
+          RAID target selection is intentionally not enabled yet.
+          We will build it after discovering the actual RAID1/PERC layout
+          in the on-prem environment.
+      when:
+        - storage_profile == 'raid1'
+
+    - name: Validate selected standalone disk
+      ansible.builtin.assert:
+        that:
+          - selected_install_disk is defined
+          - selected_install_disk.Status.Health == 'OK'
+          - not selected_install_disk.FailurePredicted
+        fail_msg: "Selected disk is missing or unhealthy."
+        success_msg: "Installation target validation PASSED."
+      when:
+        - storage_profile == 'standalone_nvme'
+
+    - name: Show selected installation target
+      ansible.builtin.debug:
+        msg:
+          id: "{{ selected_install_disk.Id }}"
+          name: "{{ selected_install_disk.Name }}"
+          model: "{{ selected_install_disk.Model }}"
+          serial: "{{ selected_install_disk.SerialNumber }}"
+          capacity_bytes: "{{ selected_install_disk.CapacityBytes }}"
+          health: "{{ selected_install_disk.Status.Health }}"
+          failure_predicted: "{{ selected_install_disk.FailurePredicted }}"
+      when:
+        - storage_profile == 'standalone_nvme'
