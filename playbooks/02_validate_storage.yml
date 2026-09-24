@@ -93,3 +93,16 @@
     - name: Final validation result
       ansible.builtin.debug:
         msg: "Storage validation completed successfully for {{ idrac_ip }}."
+        
+        
+    - name: Show physical disk inventory for provisioning
+      ansible.builtin.debug:
+        msg:
+          id: "{{ item.Id | default('UNKNOWN') }}"
+          name: "{{ item.Name | default('UNKNOWN') }}"
+          model: "{{ item.Model | default('UNKNOWN') }}"
+          serial: "{{ item.SerialNumber | default(item.Oem.Dell.DellPCIeSSD.SerialNumber | default('UNKNOWN')) }}"
+          media_type: "{{ item.MediaType | default('UNKNOWN') }}"
+          capacity_bytes: "{{ item.CapacityBytes | default('UNKNOWN') }}"
+          failure_predicted: "{{ item.FailurePredicted | default('UNKNOWN') }}"
+      loop: "{{ discovered_physical_disks }}"
