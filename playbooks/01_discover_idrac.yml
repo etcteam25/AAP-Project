@@ -44,6 +44,13 @@
     - name: Show system information
       ansible.builtin.debug:
         var: system
+        
+    - name: Show Dell service tag mapping
+      ansible.builtin.debug:
+        msg:
+          ChassisServiceTag: "{{ system.ChassisServiceTag | default('UNDEFINED') }}"
+          ServiceTag: "{{ system.ServiceTag | default('UNDEFINED') }}"
+          SerialNumber: "{{ system.SerialNumber | default('UNDEFINED') }}"
 
     - name: Show storage controllers
       ansible.builtin.debug:
