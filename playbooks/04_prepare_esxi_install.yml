@@ -1,0 +1,106 @@
+---
+- name: Prepare ESXi PXE installation files
+  hosts: pxe_server
+  gather_facts: false
+  become: true
+
+  vars:
+    esxi_version_profile: "8.0u3-dell-a10"
+
+    esxi_source_boot_cfg: "/opt/pxe/http/config/esxi/{{ esxi_version_profile }}/boot.cfg"
+
+    esxi_generated_dir: "/opt/pxe/http/config/esxi/generated/{{ esxi_hostname }}"
+
+    esxi_ks_path: "{{ esxi_generated_dir }}/ks.cfg"
+    esxi_boot_cfg_path: "{{ esxi_generated_dir }}/boot.cfg"
+
+    esxi_ks_url: "http://172.16.201.87/pxe/config/esxi/generated/{{ esxi_hostname }}/ks.cfg"
+
+    esxi_root_password: "{{ lookup('ansible.builtin.env', 'ESXI_ROOT_PASSWORD') }}"
+
+  tasks:
+
+    - name: Validate required ESXi variables
+      ansible.builtin.assert:
+        that:
+          - esxi_hostname is defined
+          - esxi_hostname | length > 0
+
+          - esxi_ip is defined
+          - esxi_ip | length > 0
+
+          - esxi_netmask is defined
+          - esxi_netmask | length > 0
+
+          - esxi_gateway is defined
+          - esxi_gateway | length > 0
+
+          - esxi_dns is defined
+          - esxi_dns | length > 0
+
+          - esxi_install_disk is defined
+          - esxi_install_disk | length > 0
+
+          - esxi_root_password | length > 0
+
+        fail_msg: "Missing required ESXi provisioning variables."
+
+    - name: Create generated ESXi configuration directory
+      ansible.builtin.file:
+        path: "{{ esxi_generated_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Generate ESXi Kickstart file
+      ansible.builtin.template:
+        src: "../templates/esxi/ks.cfg.j2"
+        dest: "{{ esxi_ks_path }}"
+        owner: root
+        group: root
+        mode: "0644"
+      no_log: true
+
+    - name: Copy known-good ESXi boot.cfg
+      ansible.builtin.copy:
+        src: "{{ esxi_source_boot_cfg }}"
+        dest: "{{ esxi_boot_cfg_path }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Point boot.cfg to generated Kickstart
+      ansible.builtin.lineinfile:
+        path: "{{ esxi_boot_cfg_path }}"
+        regexp: '^kernelopt='
+        line: "kernelopt=runweasel ks={{ esxi_ks_url }}"
+
+    - name: Verify generated Kickstart exists
+      ansible.builtin.stat:
+        path: "{{ esxi_ks_path }}"
+      register: ks_file
+
+    - name: Verify generated boot.cfg exists
+      ansible.builtin.stat:
+        path: "{{ esxi_boot_cfg_path }}"
+      register: boot_cfg_file
+
+    - name: Validate generated files
+      ansible.builtin.assert:
+        that:
+          - ks_file.stat.exists
+          - boot_cfg_file.stat.exists
+        fail_msg: "ESXi PXE configuration generation FAILED."
+        success_msg: "ESXi PXE configuration generation PASSED."
+
+    - name: Show generated ESXi configuration
+      ansible.builtin.debug:
+        msg:
+          - "Hostname: {{ esxi_hostname }}"
+          - "Management IP: {{ esxi_ip }}"
+          - "Installation disk: {{ esxi_install_disk }}"
+          - "Kickstart: {{ esxi_ks_path }}"
+          - "Boot config: {{ esxi_boot_cfg_path }}"
+          - "Kickstart URL: {{ esxi_ks_url }}"

@@ -1,0 +1,9 @@
+vmaccepteula
+
+rootpw {{ esxi_root_password }}
+
+install --disk={{ esxi_install_disk }} --overwritevmfs
+
+network --bootproto=static --device={{ esxi_mgmt_nic | default('vmnic0') }} --ip={{ esxi_ip }} --netmask={{ esxi_netmask }} --gateway={{ esxi_gateway }} --nameserver={{ esxi_dns }} --hostname={{ esxi_hostname }}
+
+reboot
