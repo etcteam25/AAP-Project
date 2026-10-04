@@ -1,0 +1,243 @@
+---
+# File 6
+# Safely disarm host-specific ESXi PXE provisioning after a successful install.
+#
+# This playbook:
+# 1. Discovers and validates the Dell NodeID/SKU.
+# 2. Verifies the autoboot file belongs to the requested ESXi hostname.
+# 3. Removes the host-specific autoboot file.
+# 4. Verifies nginx now returns HTTP 404 for that autoboot URL.
+# 5. Ensures the iDRAC One-Time PXE override is disabled.
+#
+# Generated ESXi files under config/esxi/generated/<hostname>/ are intentionally
+# preserved for audit/retry purposes.
+
+- name: Discover target Dell server identity for cleanup
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    idrac_username: "{{ lookup('ansible.builtin.env', 'IDRAC_USERNAME') }}"
+    idrac_password: "{{ lookup('ansible.builtin.env', 'IDRAC_PASSWORD') }}"
+
+  tasks:
+    - name: Validate cleanup input
+      ansible.builtin.assert:
+        that:
+          - idrac_ip is defined
+          - idrac_ip | string | length > 0
+          - esxi_hostname is defined
+          - esxi_hostname | string | length > 0
+          - cleanup_confirmation is defined
+          - cleanup_confirmation == 'DISARM_ESXI'
+        fail_msg: >-
+          Cleanup confirmation missing.
+          Set cleanup_confirmation exactly to DISARM_ESXI.
+
+    - name: Gather Dell system identity
+      ansible.builtin.include_role:
+        name: dellemc.openmanage.idrac_gather_facts
+      vars:
+        hostname: "{{ idrac_ip }}"
+        username: "{{ idrac_username }}"
+        password: "{{ idrac_password }}"
+        validate_certs: false
+        target:
+          - System
+
+    - name: Read Redfish system identity
+      ansible.builtin.uri:
+        url: "https://{{ idrac_ip }}/redfish/v1/Systems/{{ system.Id }}"
+        method: GET
+        user: "{{ idrac_username }}"
+        password: "{{ idrac_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        return_content: true
+        status_code: 200
+      register: redfish_system
+
+    - name: Validate NodeID against Redfish SKU
+      ansible.builtin.assert:
+        that:
+          - system.NodeID is defined
+          - system.NodeID | string | length > 0
+          - redfish_system.json.SKU is defined
+          - redfish_system.json.SKU | string | length > 0
+          - system.NodeID == redfish_system.json.SKU
+        fail_msg: >-
+          Server identity validation FAILED.
+          iDRAC NodeID and Redfish SKU do not match.
+        success_msg: "Server identity validation PASSED."
+
+    - name: Store cleanup identity
+      ansible.builtin.set_fact:
+        provision_node_id: "{{ system.NodeID }}"
+        provision_system_id: "{{ system.Id }}"
+
+    - name: Show cleanup target
+      ansible.builtin.debug:
+        msg:
+          - "iDRAC IP: {{ idrac_ip }}"
+          - "Model: {{ redfish_system.json.Model | default('UNKNOWN') }}"
+          - "NodeID: {{ provision_node_id }}"
+          - "Redfish SKU: {{ redfish_system.json.SKU }}"
+          - "ESXi hostname: {{ esxi_hostname }}"
+
+
+- name: Remove host-specific PXE autoboot
+  hosts: pxe_server
+  gather_facts: false
+  become: true
+
+  vars:
+    pxe_http_base: "http://172.16.201.87/pxe"
+    provision_node_id: "{{ hostvars['localhost']['provision_node_id'] }}"
+
+    autoboot_file: "/opt/pxe/http/config/autoboot/{{ provision_node_id }}.ipxe"
+    autoboot_url: "{{ pxe_http_base }}/config/autoboot/{{ provision_node_id }}.ipxe"
+    expected_boot_cfg_fragment: "/config/esxi/generated/{{ esxi_hostname }}/boot.cfg"
+
+  tasks:
+    - name: Check current autoboot file
+      ansible.builtin.stat:
+        path: "{{ autoboot_file }}"
+      register: autoboot_stat
+
+    - name: Read current autoboot file before deletion
+      ansible.builtin.slurp:
+        path: "{{ autoboot_file }}"
+      register: autoboot_content
+      when: autoboot_stat.stat.exists
+
+    - name: Validate autoboot file belongs to requested ESXi hostname
+      ansible.builtin.assert:
+        that:
+          - (autoboot_content.content | b64decode) is search(expected_boot_cfg_fragment)
+        fail_msg: >-
+          Cleanup ABORTED.
+          The autoboot file does not point to the requested ESXi hostname.
+          Refusing to remove it.
+        success_msg: "Autoboot ownership validation PASSED."
+      when: autoboot_stat.stat.exists
+
+    - name: Show already-disarmed state
+      ansible.builtin.debug:
+        msg: "Autoboot file is already absent. PXE host-specific autoboot is already disarmed."
+      when: not autoboot_stat.stat.exists
+
+    - name: Remove host-specific autoboot file
+      ansible.builtin.file:
+        path: "{{ autoboot_file }}"
+        state: absent
+      when: autoboot_stat.stat.exists
+
+    - name: Verify autoboot file is absent
+      ansible.builtin.stat:
+        path: "{{ autoboot_file }}"
+      register: autoboot_after
+
+    - name: Validate local autoboot cleanup
+      ansible.builtin.assert:
+        that:
+          - not autoboot_after.stat.exists
+        fail_msg: "Autoboot cleanup FAILED. File still exists."
+        success_msg: "Autoboot file removed successfully."
+
+    - name: Verify autoboot URL is no longer available
+      ansible.builtin.uri:
+        url: "{{ autoboot_url }}"
+        method: HEAD
+        status_code: 404
+      register: autoboot_http
+
+    - name: Show PXE cleanup result
+      ansible.builtin.debug:
+        msg:
+          - "NodeID: {{ provision_node_id }}"
+          - "Removed: {{ autoboot_file }}"
+          - "Autoboot URL: {{ autoboot_url }}"
+          - "HTTP status after cleanup: {{ autoboot_http.status }}"
+          - "Generated ESXi files were preserved."
+
+
+- name: Verify and disable Dell PXE override
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    idrac_username: "{{ lookup('ansible.builtin.env', 'IDRAC_USERNAME') }}"
+    idrac_password: "{{ lookup('ansible.builtin.env', 'IDRAC_PASSWORD') }}"
+
+    provision_node_id: "{{ hostvars['localhost']['provision_node_id'] }}"
+    provision_system_id: "{{ hostvars['localhost']['provision_system_id'] }}"
+    redfish_system_url: "https://{{ idrac_ip }}/redfish/v1/Systems/{{ provision_system_id }}"
+
+  tasks:
+    - name: Read current boot settings from Redfish
+      ansible.builtin.uri:
+        url: "{{ redfish_system_url }}"
+        method: GET
+        user: "{{ idrac_username }}"
+        password: "{{ idrac_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        return_content: true
+        status_code: 200
+      register: boot_before
+
+    - name: Show boot override before cleanup
+      ansible.builtin.debug:
+        msg:
+          BootSourceOverrideEnabled: "{{ boot_before.json.Boot.BootSourceOverrideEnabled | default('UNDEFINED') }}"
+          BootSourceOverrideTarget: "{{ boot_before.json.Boot.BootSourceOverrideTarget | default('UNDEFINED') }}"
+          BootSourceOverrideMode: "{{ boot_before.json.Boot.BootSourceOverrideMode | default('UNDEFINED') }}"
+
+    - name: Disable PXE boot override when still armed
+      dellemc.openmanage.idrac_boot:
+        idrac_ip: "{{ idrac_ip }}"
+        idrac_user: "{{ idrac_username }}"
+        idrac_password: "{{ idrac_password }}"
+        validate_certs: false
+        boot_source_override_mode: uefi
+        boot_source_override_target: pxe
+        boot_source_override_enabled: disabled
+        reset_type: none
+      register: disable_pxe_result
+      when:
+        - boot_before.json.Boot.BootSourceOverrideEnabled | default('Disabled') | lower != 'disabled'
+
+    - name: Read boot settings after cleanup
+      ansible.builtin.uri:
+        url: "{{ redfish_system_url }}"
+        method: GET
+        user: "{{ idrac_username }}"
+        password: "{{ idrac_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        return_content: true
+        status_code: 200
+      register: boot_after
+
+    - name: Validate PXE override is disabled
+      ansible.builtin.assert:
+        that:
+          - boot_after.json.Boot.BootSourceOverrideEnabled | default('') | lower == 'disabled'
+        fail_msg: >-
+          PXE autoboot file was removed, but the iDRAC boot override is still enabled.
+          Review the iDRAC boot settings.
+        success_msg: "iDRAC PXE override is disabled."
+
+    - name: Show final cleanup state
+      ansible.builtin.debug:
+        msg:
+          - "ESXi PXE cleanup PASSED."
+          - "NodeID: {{ provision_node_id }}"
+          - "ESXi hostname: {{ esxi_hostname }}"
+          - "Host-specific autoboot: DISARMED"
+          - "iDRAC PXE override: DISABLED"
+          - "Generated ESXi installation files: PRESERVED"
