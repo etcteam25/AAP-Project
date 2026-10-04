@@ -67,3 +67,26 @@
     - name: Show host NIC information
       ansible.builtin.debug:
         var: hostnic
+
+
+    - name: Read Redfish system identity directly
+      ansible.builtin.uri:
+        url: "https://{{ idrac_ip }}/redfish/v1/Systems/{{ system.Id }}"
+        method: GET
+        user: "{{ idrac_username }}"
+        password: "{{ idrac_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        return_content: true
+      register: redfish_system
+
+    - name: Show Redfish server identity
+      ansible.builtin.debug:
+        msg:
+          id: "{{ redfish_system.json.Id | default('UNDEFINED') }}"
+          manufacturer: "{{ redfish_system.json.Manufacturer | default('UNDEFINED') }}"
+          model: "{{ redfish_system.json.Model | default('UNDEFINED') }}"
+          serial_number: "{{ redfish_system.json.SerialNumber | default('UNDEFINED') }}"
+          sku: "{{ redfish_system.json.SKU | default('UNDEFINED') }}"
+          asset_tag: "{{ redfish_system.json.AssetTag | default('UNDEFINED') }}"
+          uuid: "{{ redfish_system.json.UUID | default('UNDEFINED') }}"
