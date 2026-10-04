@@ -1,0 +1,166 @@
+---
+- name: Discover target Dell server identity
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    idrac_username: "{{ lookup('ansible.builtin.env', 'IDRAC_USERNAME') }}"
+    idrac_password: "{{ lookup('ansible.builtin.env', 'IDRAC_PASSWORD') }}"
+
+  tasks:
+    - name: Validate required provisioning input
+      ansible.builtin.assert:
+        that:
+          - idrac_ip is defined
+          - idrac_ip | length > 0
+          - esxi_hostname is defined
+          - esxi_hostname | length > 0
+          - provision_confirmation is defined
+          - provision_confirmation == 'INSTALL_ESXI'
+        fail_msg: >-
+          Provisioning confirmation missing.
+          Set provision_confirmation exactly to INSTALL_ESXI.
+
+    - name: Gather Dell system identity
+      ansible.builtin.include_role:
+        name: dellemc.openmanage.idrac_gather_facts
+      vars:
+        hostname: "{{ idrac_ip }}"
+        username: "{{ idrac_username }}"
+        password: "{{ idrac_password }}"
+        validate_certs: false
+        target:
+          - System
+
+    - name: Read Redfish system identity
+      ansible.builtin.uri:
+        url: "https://{{ idrac_ip }}/redfish/v1/Systems/{{ system.Id }}"
+        method: GET
+        user: "{{ idrac_username }}"
+        password: "{{ idrac_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        return_content: true
+      register: redfish_system
+
+    - name: Validate NodeID against Redfish SKU
+      ansible.builtin.assert:
+        that:
+          - system.NodeID is defined
+          - system.NodeID | length > 0
+          - redfish_system.json.SKU is defined
+          - system.NodeID == redfish_system.json.SKU
+        fail_msg: >-
+          Server identity validation FAILED.
+          iDRAC NodeID and Redfish SKU do not match.
+        success_msg: "Server identity validation PASSED."
+
+    - name: Store provisioning NodeID
+      ansible.builtin.set_fact:
+        provision_node_id: "{{ system.NodeID }}"
+
+    - name: Show target server identity
+      ansible.builtin.debug:
+        msg:
+          - "iDRAC IP: {{ idrac_ip }}"
+          - "Model: {{ redfish_system.json.Model | default('UNKNOWN') }}"
+          - "NodeID: {{ provision_node_id }}"
+          - "Redfish SKU: {{ redfish_system.json.SKU }}"
+          - "ESXi hostname: {{ esxi_hostname }}"
+
+
+- name: Arm host-specific PXE autoboot
+  hosts: pxe_server
+  gather_facts: false
+  become: true
+
+  vars:
+    pxe_http_base: "http://172.16.201.87/pxe"
+
+    provision_node_id: "{{ hostvars['localhost']['provision_node_id'] }}"
+
+    generated_boot_ipxe: "/opt/pxe/http/config/esxi/generated/{{ esxi_hostname }}/boot.ipxe"
+
+    autoboot_file: "/opt/pxe/http/config/autoboot/{{ provision_node_id }}.ipxe"
+
+    autoboot_url: "{{ pxe_http_base }}/config/autoboot/{{ provision_node_id }}.ipxe"
+
+  tasks:
+    - name: Verify generated ESXi boot.ipxe exists
+      ansible.builtin.stat:
+        path: "{{ generated_boot_ipxe }}"
+      register: generated_boot
+
+    - name: Stop if File 4 output does not exist
+      ansible.builtin.assert:
+        that:
+          - generated_boot.stat.exists
+        fail_msg: >-
+          Generated ESXi boot.ipxe was not found.
+          Run 04_prepare_esxi_install.yml first.
+
+    - name: Arm server autoboot
+      ansible.builtin.copy:
+        src: "{{ generated_boot_ipxe }}"
+        dest: "{{ autoboot_file }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Verify autoboot file through nginx
+      ansible.builtin.uri:
+        url: "{{ autoboot_url }}"
+        method: HEAD
+        status_code: 200
+      register: autoboot_http
+
+    - name: Show armed PXE target
+      ansible.builtin.debug:
+        msg:
+          - "NodeID: {{ provision_node_id }}"
+          - "Autoboot file: {{ autoboot_file }}"
+          - "Autoboot URL: {{ autoboot_url }}"
+          - "HTTP status: {{ autoboot_http.status }}"
+
+
+- name: Trigger Dell One-Time PXE boot
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    idrac_username: "{{ lookup('ansible.builtin.env', 'IDRAC_USERNAME') }}"
+    idrac_password: "{{ lookup('ansible.builtin.env', 'IDRAC_PASSWORD') }}"
+
+  tasks:
+    - name: Show destructive action warning
+      ansible.builtin.debug:
+        msg:
+          - "WARNING: Server {{ idrac_ip }} will now restart."
+          - "One-Time PXE boot will be configured."
+          - "ESXi automated installation is armed."
+
+    - name: Configure One-Time UEFI PXE and restart server
+      dellemc.openmanage.idrac_boot:
+        idrac_ip: "{{ idrac_ip }}"
+        idrac_user: "{{ idrac_username }}"
+        idrac_password: "{{ idrac_password }}"
+        validate_certs: false
+        boot_source_override_mode: uefi
+        boot_source_override_target: pxe
+        boot_source_override_enabled: once
+        reset_type: force_restart
+        job_wait: true
+        job_wait_timeout: 900
+      register: pxe_boot_result
+
+    - name: Show iDRAC PXE result
+      ansible.builtin.debug:
+        msg:
+          - "One-Time PXE request submitted successfully."
+          - "Target NodeID: {{ hostvars['localhost']['provision_node_id'] }}"
+          - "iDRAC: {{ idrac_ip }}"
