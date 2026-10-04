@@ -1,4 +1,8 @@
 ---
+# File 5
+# Arm host-specific ESXi PXE autoboot, verify the Dell One-Time PXE
+# setting through Redfish, and only then restart the target server.
+
 - name: Discover target Dell server identity
   hosts: localhost
   connection: local
@@ -14,9 +18,9 @@
       ansible.builtin.assert:
         that:
           - idrac_ip is defined
-          - idrac_ip | length > 0
+          - idrac_ip | string | length > 0
           - esxi_hostname is defined
-          - esxi_hostname | length > 0
+          - esxi_hostname | string | length > 0
           - provision_confirmation is defined
           - provision_confirmation == 'INSTALL_ESXI'
         fail_msg: >-
@@ -43,23 +47,26 @@
         force_basic_auth: true
         validate_certs: false
         return_content: true
+        status_code: 200
       register: redfish_system
 
     - name: Validate NodeID against Redfish SKU
       ansible.builtin.assert:
         that:
           - system.NodeID is defined
-          - system.NodeID | length > 0
+          - system.NodeID | string | length > 0
           - redfish_system.json.SKU is defined
+          - redfish_system.json.SKU | string | length > 0
           - system.NodeID == redfish_system.json.SKU
         fail_msg: >-
           Server identity validation FAILED.
           iDRAC NodeID and Redfish SKU do not match.
         success_msg: "Server identity validation PASSED."
 
-    - name: Store provisioning NodeID
+    - name: Store target server identity
       ansible.builtin.set_fact:
         provision_node_id: "{{ system.NodeID }}"
+        provision_system_id: "{{ system.Id }}"
 
     - name: Show target server identity
       ansible.builtin.debug:
@@ -68,6 +75,8 @@
           - "Model: {{ redfish_system.json.Model | default('UNKNOWN') }}"
           - "NodeID: {{ provision_node_id }}"
           - "Redfish SKU: {{ redfish_system.json.SKU }}"
+          - "Redfish SerialNumber: {{ redfish_system.json.SerialNumber | default('UNKNOWN') }}"
+          - "System resource ID: {{ provision_system_id }}"
           - "ESXi hostname: {{ esxi_hostname }}"
 
 
@@ -78,13 +87,10 @@
 
   vars:
     pxe_http_base: "http://172.16.201.87/pxe"
-
     provision_node_id: "{{ hostvars['localhost']['provision_node_id'] }}"
 
     generated_boot_ipxe: "/opt/pxe/http/config/esxi/generated/{{ esxi_hostname }}/boot.ipxe"
-
     autoboot_file: "/opt/pxe/http/config/autoboot/{{ provision_node_id }}.ipxe"
-
     autoboot_url: "{{ pxe_http_base }}/config/autoboot/{{ provision_node_id }}.ipxe"
 
   tasks:
@@ -97,6 +103,7 @@
       ansible.builtin.assert:
         that:
           - generated_boot.stat.exists
+          - generated_boot.stat.isreg
         fail_msg: >-
           Generated ESXi boot.ipxe was not found.
           Run 04_prepare_esxi_install.yml first.
@@ -126,7 +133,7 @@
           - "HTTP status: {{ autoboot_http.status }}"
 
 
-- name: Trigger Dell One-Time PXE boot
+- name: Configure verify and trigger Dell One-Time PXE boot
   hosts: localhost
   connection: local
   gather_facts: false
@@ -136,31 +143,108 @@
     idrac_username: "{{ lookup('ansible.builtin.env', 'IDRAC_USERNAME') }}"
     idrac_password: "{{ lookup('ansible.builtin.env', 'IDRAC_PASSWORD') }}"
 
+    provision_node_id: "{{ hostvars['localhost']['provision_node_id'] }}"
+    provision_system_id: "{{ hostvars['localhost']['provision_system_id'] }}"
+
+    redfish_system_url: "https://{{ idrac_ip }}/redfish/v1/Systems/{{ provision_system_id }}"
+    autoboot_file: "/opt/pxe/http/config/autoboot/{{ provision_node_id }}.ipxe"
+
   tasks:
     - name: Show destructive action warning
       ansible.builtin.debug:
         msg:
-          - "WARNING: Server {{ idrac_ip }} will now restart."
-          - "One-Time PXE boot will be configured."
-          - "ESXi automated installation is armed."
+          - "WARNING: ESXi automated installation is armed."
+          - "Target iDRAC: {{ idrac_ip }}"
+          - "Target NodeID: {{ provision_node_id }}"
+          - "The server will NOT restart until the PXE setting is verified."
 
-    - name: Configure One-Time UEFI PXE and restart server
-      dellemc.openmanage.idrac_boot:
-        idrac_ip: "{{ idrac_ip }}"
-        idrac_user: "{{ idrac_username }}"
-        idrac_password: "{{ idrac_password }}"
-        validate_certs: false
-        boot_source_override_mode: uefi
-        boot_source_override_target: pxe
-        boot_source_override_enabled: once
-        reset_type: force_restart
-        job_wait: true
-        job_wait_timeout: 900
-      register: pxe_boot_result
+    - name: Configure verify and restart
+      block:
+        - name: Configure One-Time UEFI PXE without restarting
+          dellemc.openmanage.idrac_boot:
+            idrac_ip: "{{ idrac_ip }}"
+            idrac_user: "{{ idrac_username }}"
+            idrac_password: "{{ idrac_password }}"
+            validate_certs: false
+            boot_source_override_mode: uefi
+            boot_source_override_target: pxe
+            boot_source_override_enabled: once
+            reset_type: none
+          register: pxe_boot_config
 
-    - name: Show iDRAC PXE result
-      ansible.builtin.debug:
-        msg:
-          - "One-Time PXE request submitted successfully."
-          - "Target NodeID: {{ hostvars['localhost']['provision_node_id'] }}"
-          - "iDRAC: {{ idrac_ip }}"
+        - name: Show Dell idrac_boot result
+          ansible.builtin.debug:
+            var: pxe_boot_config
+
+        - name: Read boot settings directly from Redfish
+          ansible.builtin.uri:
+            url: "{{ redfish_system_url }}"
+            method: GET
+            user: "{{ idrac_username }}"
+            password: "{{ idrac_password }}"
+            force_basic_auth: true
+            validate_certs: false
+            return_content: true
+            status_code: 200
+          register: redfish_boot_verify
+
+        - name: Show actual Redfish boot settings
+          ansible.builtin.debug:
+            msg:
+              BootSourceOverrideEnabled: "{{ redfish_boot_verify.json.Boot.BootSourceOverrideEnabled | default('UNDEFINED') }}"
+              BootSourceOverrideTarget: "{{ redfish_boot_verify.json.Boot.BootSourceOverrideTarget | default('UNDEFINED') }}"
+              BootSourceOverrideMode: "{{ redfish_boot_verify.json.Boot.BootSourceOverrideMode | default('UNDEFINED') }}"
+
+        - name: Validate One-Time PXE configuration before restart
+          ansible.builtin.assert:
+            that:
+              - redfish_boot_verify.json.Boot is defined
+              - redfish_boot_verify.json.Boot.BootSourceOverrideEnabled | default('') | lower == 'once'
+              - redfish_boot_verify.json.Boot.BootSourceOverrideTarget | default('') | lower == 'pxe'
+              - redfish_boot_verify.json.Boot.BootSourceOverrideMode | default('') | lower == 'uefi'
+            fail_msg: >-
+              PXE boot override verification FAILED.
+              Server will NOT be restarted.
+            success_msg: >-
+              PXE boot override verification PASSED.
+              Safe to restart server.
+
+        - name: Restart server through Redfish
+          ansible.builtin.uri:
+            url: "{{ redfish_system_url }}/Actions/ComputerSystem.Reset"
+            method: POST
+            user: "{{ idrac_username }}"
+            password: "{{ idrac_password }}"
+            force_basic_auth: true
+            validate_certs: false
+            body_format: json
+            body:
+              ResetType: ForceRestart
+            status_code:
+              - 200
+              - 202
+              - 204
+          register: server_restart
+
+        - name: Show restart result
+          ansible.builtin.debug:
+            msg:
+              - "PXE override verified successfully."
+              - "Server restart submitted."
+              - "NodeID: {{ provision_node_id }}"
+              - "iDRAC: {{ idrac_ip }}"
+
+      rescue:
+        - name: Disarm PXE autoboot after verification or restart failure
+          ansible.builtin.file:
+            path: "{{ autoboot_file }}"
+            state: absent
+          delegate_to: "{{ groups['pxe_server'][0] }}"
+          become: true
+
+        - name: Stop provisioning safely
+          ansible.builtin.fail:
+            msg: >-
+              File 5 stopped before a verified PXE installation start.
+              The host-specific autoboot file was removed for safety.
+              Review the failed task before retrying.
