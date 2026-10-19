@@ -19,7 +19,6 @@
           - idrac_username | string | length > 0
           - idrac_password | string | length > 0
         fail_msg: "idrac_ip or Dell iDRAC credential is missing."
-        success_msg: "Required iDRAC input is present."
       no_log: true
 
     - name: Read Redfish Systems collection
@@ -91,13 +90,28 @@
           - storage_collection.json.Members | length > 0
         fail_msg: "No Redfish Storage resources were found."
 
-    - name: Build storage resource URI list
+    # IMPORTANT:
+    # Do not use map(attribute='@odata.id'). The dot in the literal JSON key
+    # is interpreted as a nested attribute path by Jinja/Ansible.
+    - name: Initialize storage URI list
       ansible.builtin.set_fact:
-        storage_uris: "{{ storage_collection.json.Members | map(attribute='@odata.id') | list }}"
+        storage_uris: []
 
-    - name: Show storage URIs that will be read
-      ansible.builtin.debug:
-        var: storage_uris
+    - name: Collect storage resource URIs
+      ansible.builtin.set_fact:
+        storage_uris: "{{ storage_uris + [storage_member['@odata.id']] }}"
+      loop: "{{ storage_collection.json.Members }}"
+      loop_control:
+        loop_var: storage_member
+        label: "{{ storage_member['@odata.id'] | default('unknown-storage-member') }}"
+      when:
+        - storage_member['@odata.id'] is defined
+
+    - name: Validate storage URI list
+      ansible.builtin.assert:
+        that:
+          - storage_uris | length > 0
+        fail_msg: "Storage members exist, but none contained a literal '@odata.id' key."
 
     - name: Read each storage resource
       ansible.builtin.uri:
@@ -113,7 +127,7 @@
       loop_control:
         loop_var: storage_uri
         label: "{{ storage_uri }}"
-      register: storage_resources
+      register: storage_results
       changed_when: false
       no_log: true
 
@@ -127,7 +141,7 @@
           - "Health: {{ storage_result.json.Status.Health | default('N/A') }}"
           - "State: {{ storage_result.json.Status.State | default('N/A') }}"
           - "Volumes URI: {{ storage_result.json.Volumes['@odata.id'] if (storage_result.json.Volumes is defined and storage_result.json.Volumes['@odata.id'] is defined) else 'N/A' }}"
-      loop: "{{ storage_resources.results }}"
+      loop: "{{ storage_results.results }}"
       loop_control:
         loop_var: storage_result
         label: "{{ storage_result.json.Id | default(storage_result.storage_uri) }}"
@@ -139,9 +153,10 @@
     - name: Collect volume collection URIs
       ansible.builtin.set_fact:
         volume_collection_uris: "{{ volume_collection_uris + [storage_result.json.Volumes['@odata.id']] }}"
-      loop: "{{ storage_resources.results }}"
+      loop: "{{ storage_results.results }}"
       loop_control:
         loop_var: storage_result
+        label: "{{ storage_result.json.Id | default(storage_result.storage_uri) }}"
       when:
         - storage_result.json.Volumes is defined
         - storage_result.json.Volumes['@odata.id'] is defined
@@ -150,9 +165,11 @@
       ansible.builtin.set_fact:
         volume_collection_uris: "{{ volume_collection_uris | unique | list }}"
 
-    - name: Show volume collections that will be read
-      ansible.builtin.debug:
-        var: volume_collection_uris
+    - name: Validate volume collections were found
+      ansible.builtin.assert:
+        that:
+          - volume_collection_uris | length > 0
+        fail_msg: "No Redfish volume collection links were found on the storage resources."
 
     - name: Read volume collections
       ansible.builtin.uri:
@@ -168,28 +185,45 @@
       loop_control:
         loop_var: volume_collection_uri
         label: "{{ volume_collection_uri }}"
-      register: volume_collections
+      register: volume_collection_results
       changed_when: false
       no_log: true
+
+    - name: Initialize flat volume member list
+      ansible.builtin.set_fact:
+        volume_members: []
+
+    - name: Add members from each volume collection
+      ansible.builtin.set_fact:
+        volume_members: "{{ volume_members + (volume_collection_result.json.Members | default([])) }}"
+      loop: "{{ volume_collection_results.results }}"
+      loop_control:
+        loop_var: volume_collection_result
+        label: "{{ volume_collection_result.volume_collection_uri }}"
 
     - name: Initialize volume URI list
       ansible.builtin.set_fact:
         volume_uris: []
 
-    - name: Collect volume URIs
+    - name: Collect virtual disk or volume URIs
       ansible.builtin.set_fact:
-        volume_uris: "{{ volume_uris + (volume_collection_result.json.Members | default([]) | map(attribute='@odata.id') | list) }}"
-      loop: "{{ volume_collections.results | default([]) }}"
+        volume_uris: "{{ volume_uris + [volume_member['@odata.id']] }}"
+      loop: "{{ volume_members }}"
       loop_control:
-        loop_var: volume_collection_result
+        loop_var: volume_member
+        label: "{{ volume_member['@odata.id'] | default('unknown-volume-member') }}"
+      when:
+        - volume_member['@odata.id'] is defined
 
     - name: Remove duplicate volume URIs
       ansible.builtin.set_fact:
         volume_uris: "{{ volume_uris | unique | list }}"
 
-    - name: Show volume URIs that will be read
-      ansible.builtin.debug:
-        var: volume_uris
+    - name: Validate virtual disks were found
+      ansible.builtin.assert:
+        that:
+          - volume_uris | length > 0
+        fail_msg: "No virtual disks / Redfish volumes were found."
 
     - name: Read each virtual disk or volume
       ansible.builtin.uri:
@@ -205,7 +239,7 @@
       loop_control:
         loop_var: volume_uri
         label: "{{ volume_uri }}"
-      register: volumes
+      register: volume_results
       changed_when: false
       no_log: true
 
@@ -220,8 +254,8 @@
           - "Health: {{ volume_result.json.Status.Health | default('N/A') }}"
           - "State: {{ volume_result.json.Status.State | default('N/A') }}"
           - "Identifiers: {{ volume_result.json.Identifiers | default([]) }}"
-          - "Linked drives: {{ volume_result.json.Links.Drives | default([]) }}"
-      loop: "{{ volumes.results | default([]) }}"
+          - "Linked drives: {{ volume_result.json.Links.Drives | default([]) if volume_result.json.Links is defined else [] }}"
+      loop: "{{ volume_results.results }}"
       loop_control:
         loop_var: volume_result
         label: "{{ volume_result.json.Name | default(volume_result.json.Id | default('volume')) }}"
@@ -237,78 +271,13 @@
           - "State: {{ volume_result.json.Status.State | default('N/A') }}"
           - "Capacity GiB: {{ ((volume_result.json.CapacityBytes | default(0) | int) / 1073741824) | round(2) }}"
           - "Identifiers: {{ volume_result.json.Identifiers | default([]) }}"
-          - "Linked drives: {{ volume_result.json.Links.Drives | default([]) }}"
-      loop: "{{ volumes.results | default([]) }}"
+          - "Linked drives: {{ volume_result.json.Links.Drives | default([]) if volume_result.json.Links is defined else [] }}"
+      loop: "{{ volume_results.results }}"
       loop_control:
         loop_var: volume_result
         label: "{{ volume_result.json.Name | default(volume_result.json.Id | default('RAID1')) }}"
       when:
-        - volume_result.json.RAIDType | default('') | upper == 'RAID1'
-
-    - name: Initialize drive URI list
-      ansible.builtin.set_fact:
-        drive_uris: []
-
-    - name: Collect drives exposed by storage resources
-      ansible.builtin.set_fact:
-        drive_uris: "{{ drive_uris + (storage_result.json.Drives | default([]) | map(attribute='@odata.id') | list) }}"
-      loop: "{{ storage_resources.results }}"
-      loop_control:
-        loop_var: storage_result
-
-    - name: Collect drives linked to volumes
-      ansible.builtin.set_fact:
-        drive_uris: "{{ drive_uris + (volume_result.json.Links.Drives | default([]) | map(attribute='@odata.id') | list) }}"
-      loop: "{{ volumes.results | default([]) }}"
-      loop_control:
-        loop_var: volume_result
-      when:
-        - volume_result.json.Links is defined
-
-    - name: Remove duplicate drive URIs
-      ansible.builtin.set_fact:
-        drive_uris: "{{ drive_uris | unique | list }}"
-
-    - name: Show physical drive URIs that will be read
-      ansible.builtin.debug:
-        var: drive_uris
-
-    - name: Read physical drives
-      ansible.builtin.uri:
-        url: "{{ redfish_base }}{{ drive_uri }}"
-        method: GET
-        user: "{{ idrac_username }}"
-        password: "{{ idrac_password }}"
-        force_basic_auth: true
-        validate_certs: "{{ idrac_validate_certs }}"
-        return_content: true
-        status_code: 200
-      loop: "{{ drive_uris }}"
-      loop_control:
-        loop_var: drive_uri
-        label: "{{ drive_uri }}"
-      register: drives
-      changed_when: false
-      no_log: true
-
-    - name: Show physical drives
-      ansible.builtin.debug:
-        msg:
-          - "Drive URI: {{ drive_result.drive_uri }}"
-          - "ID: {{ drive_result.json.Id | default('N/A') }}"
-          - "Name: {{ drive_result.json.Name | default('N/A') }}"
-          - "Model: {{ drive_result.json.Model | default('N/A') }}"
-          - "SerialNumber: {{ drive_result.json.SerialNumber | default('N/A') }}"
-          - "Protocol: {{ drive_result.json.Protocol | default('N/A') }}"
-          - "MediaType: {{ drive_result.json.MediaType | default('N/A') }}"
-          - "Capacity GiB: {{ ((drive_result.json.CapacityBytes | default(0) | int) / 1073741824) | round(2) }}"
-          - "Health: {{ drive_result.json.Status.Health | default('N/A') }}"
-          - "State: {{ drive_result.json.Status.State | default('N/A') }}"
-          - "Identifiers: {{ drive_result.json.Identifiers | default([]) }}"
-      loop: "{{ drives.results | default([]) }}"
-      loop_control:
-        loop_var: drive_result
-        label: "{{ drive_result.json.Id | default(drive_result.drive_uri) }}"
+        - (volume_result.json.RAIDType | default('') | upper) == 'RAID1'
 
     - name: Final read-only summary
       ansible.builtin.debug:
@@ -316,7 +285,6 @@
           - "READ-ONLY RAID discovery completed."
           - "System: {{ system_info.json.Model | default('N/A') }}"
           - "NodeID/SKU: {{ system_info.json.SKU | default('N/A') }}"
-          - "Storage resources: {{ storage_resources.results | length }}"
+          - "Storage resources: {{ storage_uris | length }}"
           - "Volumes discovered: {{ volume_uris | length }}"
-          - "Physical drives discovered: {{ drive_uris | length }}"
           - "No POST, PATCH, PUT, DELETE, reboot, RAID creation, boot-order change or PXE action was performed."
