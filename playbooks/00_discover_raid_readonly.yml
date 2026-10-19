@@ -1,0 +1,128 @@
+
+    - name: Collect volume URIs
+      ansible.builtin.set_fact:
+        volume_uris: "{{ volume_uris + (item.json.Members | default([]) | map(attribute='@odata.id') | list) }}"
+      loop: "{{ volume_collections.results | default([]) }}"
+      when:
+        - item.skipped is not defined or not item.skipped
+        - item.json is defined
+
+    - name: Remove duplicate volume URIs
+      ansible.builtin.set_fact:
+        volume_uris: "{{ volume_uris | unique | list }}"
+
+    - name: Read each virtual disk or volume
+      ansible.builtin.uri:
+        url: "{{ redfish_base }}{{ item }}"
+        method: GET
+        user: "{{ idrac_username }}"
+        password: "{{ idrac_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ idrac_validate_certs }}"
+        return_content: true
+        status_code: 200
+      loop: "{{ volume_uris }}"
+      loop_control:
+        label: "{{ item }}"
+      register: volumes
+      changed_when: false
+      no_log: true
+      when: volume_uris | length > 0
+
+    - name: Show all discovered virtual disks
+      ansible.builtin.debug:
+        msg:
+          - "Volume URI: {{ item.item }}"
+          - "ID: {{ item.json.Id | default('N/A') }}"
+          - "Name: {{ item.json.Name | default('N/A') }}"
+          - "RAIDType: {{ item.json.RAIDType | default('N/A') }}"
+          - "Capacity GiB: {{ ((item.json.CapacityBytes | default(0) | int) / 1073741824) | round(2) }}"
+          - "Health: {{ item.json.Status.Health | default('N/A') }}"
+          - "State: {{ item.json.Status.State | default('N/A') }}"
+          - "Identifiers: {{ item.json.Identifiers | default([]) }}"
+          - "Linked drives: {{ item.json.Links.Drives | default([]) }}"
+      loop: "{{ volumes.results | default([]) }}"
+      when: item.skipped is not defined or not item.skipped
+      loop_control:
+        label: "{{ item.json.Name | default(item.json.Id | default('volume')) }}"
+
+    - name: Show RAID1 candidate volumes
+      ansible.builtin.debug:
+        msg:
+          - "RAID1 CANDIDATE FOUND"
+          - "ID: {{ item.json.Id | default('N/A') }}"
+          - "Name: {{ item.json.Name | default('N/A') }}"
+          - "RAIDType: {{ item.json.RAIDType | default('N/A') }}"
+          - "Health: {{ item.json.Status.Health | default('N/A') }}"
+          - "State: {{ item.json.Status.State | default('N/A') }}"
+          - "Capacity GiB: {{ ((item.json.CapacityBytes | default(0) | int) / 1073741824) | round(2) }}"
+          - "Identifiers: {{ item.json.Identifiers | default([]) }}"
+          - "Linked drives: {{ item.json.Links.Drives | default([]) }}"
+      loop: "{{ volumes.results | default([]) }}"
+      when:
+        - item.skipped is not defined or not item.skipped
+        - item.json.RAIDType | default('') | upper == 'RAID1'
+      loop_control:
+        label: "{{ item.json.Name | default(item.json.Id | default('RAID1')) }}"
+
+    - name: Initialize drive URI list
+      ansible.builtin.set_fact:
+        drive_uris: []
+
+    - name: Collect drives exposed by storage resources
+      ansible.builtin.set_fact:
+        drive_uris: "{{ drive_uris + (item.json.Drives | default([]) | map(attribute='@odata.id') | list) }}"
+      loop: "{{ storage_resources.results }}"
+
+    - name: Collect drives linked to volumes
+      ansible.builtin.set_fact:
+        drive_uris: "{{ drive_uris + (item.json.Links.Drives | default([]) | map(attribute='@odata.id') | list) }}"
+      loop: "{{ volumes.results | default([]) }}"
+      when:
+        - item.skipped is not defined or not item.skipped
+        - item.json.Links is defined
+
+    - name: Remove duplicate drive URIs
+      ansible.builtin.set_fact:
+        drive_uris: "{{ drive_uris | unique | list }}"
+
+    - name: Read physical drives
+      ansible.builtin.uri:
+        url: "{{ redfish_base }}{{ item }}"
+        method: GET
+        user: "{{ idrac_username }}"
+        password: "{{ idrac_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ idrac_validate_certs }}"
+        return_content: true
+        status_code: 200
+      loop: "{{ drive_uris }}"
+      loop_control:
+        label: "{{ item }}"
+      register: drives
+      changed_when: false
+      no_log: true
+      when: drive_uris | length > 0
+
+    - name: Show physical drives
+      ansible.builtin.debug:
+        msg:
+          - "Drive URI: {{ item.item }}"
+          - "ID: {{ item.json.Id | default('N/A') }}"
+          - "Name: {{ item.json.Name | default('N/A') }}"
+          - "Model: {{ item.json.Model | default('N/A') }}"
+          - "SerialNumber: {{ item.json.SerialNumber | default('N/A') }}"
+          - "Protocol: {{ item.json.Protocol | default('N/A') }}"
+          - "MediaType: {{ item.json.MediaType | default('N/A') }}"
+          - "Capacity GiB: {{ ((item.json.CapacityBytes | default(0) | int) / 1073741824) | round(2) }}"
+          - "Health: {{ item.json.Status.Health | default('N/A') }}"
+          - "State: {{ item.json.Status.State | default('N/A') }}"
+          - "Identifiers: {{ item.json.Identifiers | default([]) }}"
+      loop: "{{ drives.results | default([]) }}"
+      when: item.skipped is not defined or not item.skipped
+      loop_control:
+        label: "{{ item.json.Id | default('drive') }}"
+
+    - name: Final read-only summary
+      ansible.builtin.debug:
+        msg:
