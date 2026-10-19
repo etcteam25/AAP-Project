@@ -1,19 +1,30 @@
+---
+- name: Discover Dell RAID storage via Redfish - READ ONLY
+  hosts: localhost
+  connection: local
+  gather_facts: false
 
-    - name: Collect volume URIs
-      ansible.builtin.set_fact:
-        volume_uris: "{{ volume_uris + (item.json.Members | default([]) | map(attribute='@odata.id') | list) }}"
-      loop: "{{ volume_collections.results | default([]) }}"
-      when:
-        - item.skipped is not defined or not item.skipped
-        - item.json is defined
+  vars:
+    idrac_username: "{{ lookup('ansible.builtin.env', 'IDRAC_USERNAME') }}"
+    idrac_password: "{{ lookup('ansible.builtin.env', 'IDRAC_PASSWORD') }}"
+    idrac_validate_certs: false
+    redfish_base: "https://{{ idrac_ip }}"
 
-    - name: Remove duplicate volume URIs
-      ansible.builtin.set_fact:
-        volume_uris: "{{ volume_uris | unique | list }}"
+  tasks:
+    - name: Validate required input and credential
+      ansible.builtin.assert:
+        that:
+          - idrac_ip is defined
+          - idrac_ip | string | length > 0
+          - idrac_username | string | length > 0
+          - idrac_password | string | length > 0
+        fail_msg: "idrac_ip or Dell iDRAC credential is missing."
+        success_msg: "Required iDRAC input is present."
+      no_log: true
 
-    - name: Read each virtual disk or volume
+    - name: Read Redfish Systems collection
       ansible.builtin.uri:
-        url: "{{ redfish_base }}{{ item }}"
+        url: "{{ redfish_base }}/redfish/v1/Systems"
         method: GET
         user: "{{ idrac_username }}"
         password: "{{ idrac_password }}"
@@ -21,74 +32,24 @@
         validate_certs: "{{ idrac_validate_certs }}"
         return_content: true
         status_code: 200
-      loop: "{{ volume_uris }}"
-      loop_control:
-        label: "{{ item }}"
-      register: volumes
+      register: systems_collection
       changed_when: false
       no_log: true
-      when: volume_uris | length > 0
 
-    - name: Show all discovered virtual disks
-      ansible.builtin.debug:
-        msg:
-          - "Volume URI: {{ item.item }}"
-          - "ID: {{ item.json.Id | default('N/A') }}"
-          - "Name: {{ item.json.Name | default('N/A') }}"
-          - "RAIDType: {{ item.json.RAIDType | default('N/A') }}"
-          - "Capacity GiB: {{ ((item.json.CapacityBytes | default(0) | int) / 1073741824) | round(2) }}"
-          - "Health: {{ item.json.Status.Health | default('N/A') }}"
-          - "State: {{ item.json.Status.State | default('N/A') }}"
-          - "Identifiers: {{ item.json.Identifiers | default([]) }}"
-          - "Linked drives: {{ item.json.Links.Drives | default([]) }}"
-      loop: "{{ volumes.results | default([]) }}"
-      when: item.skipped is not defined or not item.skipped
-      loop_control:
-        label: "{{ item.json.Name | default(item.json.Id | default('volume')) }}"
+    - name: Validate that a Redfish system was found
+      ansible.builtin.assert:
+        that:
+          - systems_collection.json.Members is defined
+          - systems_collection.json.Members | length > 0
+        fail_msg: "No ComputerSystem resource was returned by iDRAC."
 
-    - name: Show RAID1 candidate volumes
-      ansible.builtin.debug:
-        msg:
-          - "RAID1 CANDIDATE FOUND"
-          - "ID: {{ item.json.Id | default('N/A') }}"
-          - "Name: {{ item.json.Name | default('N/A') }}"
-          - "RAIDType: {{ item.json.RAIDType | default('N/A') }}"
-          - "Health: {{ item.json.Status.Health | default('N/A') }}"
-          - "State: {{ item.json.Status.State | default('N/A') }}"
-          - "Capacity GiB: {{ ((item.json.CapacityBytes | default(0) | int) / 1073741824) | round(2) }}"
-          - "Identifiers: {{ item.json.Identifiers | default([]) }}"
-          - "Linked drives: {{ item.json.Links.Drives | default([]) }}"
-      loop: "{{ volumes.results | default([]) }}"
-      when:
-        - item.skipped is not defined or not item.skipped
-        - item.json.RAIDType | default('') | upper == 'RAID1'
-      loop_control:
-        label: "{{ item.json.Name | default(item.json.Id | default('RAID1')) }}"
-
-    - name: Initialize drive URI list
+    - name: Save system URI
       ansible.builtin.set_fact:
-        drive_uris: []
+        system_uri: "{{ systems_collection.json.Members[0]['@odata.id'] }}"
 
-    - name: Collect drives exposed by storage resources
-      ansible.builtin.set_fact:
-        drive_uris: "{{ drive_uris + (item.json.Drives | default([]) | map(attribute='@odata.id') | list) }}"
-      loop: "{{ storage_resources.results }}"
-
-    - name: Collect drives linked to volumes
-      ansible.builtin.set_fact:
-        drive_uris: "{{ drive_uris + (item.json.Links.Drives | default([]) | map(attribute='@odata.id') | list) }}"
-      loop: "{{ volumes.results | default([]) }}"
-      when:
-        - item.skipped is not defined or not item.skipped
-        - item.json.Links is defined
-
-    - name: Remove duplicate drive URIs
-      ansible.builtin.set_fact:
-        drive_uris: "{{ drive_uris | unique | list }}"
-
-    - name: Read physical drives
+    - name: Read server identity
       ansible.builtin.uri:
-        url: "{{ redfish_base }}{{ item }}"
+        url: "{{ redfish_base }}{{ system_uri }}"
         method: GET
         user: "{{ idrac_username }}"
         password: "{{ idrac_password }}"
@@ -96,33 +57,40 @@
         validate_certs: "{{ idrac_validate_certs }}"
         return_content: true
         status_code: 200
-      loop: "{{ drive_uris }}"
-      loop_control:
-        label: "{{ item }}"
-      register: drives
+      register: system_info
       changed_when: false
       no_log: true
-      when: drive_uris | length > 0
 
-    - name: Show physical drives
+    - name: Show server identity
       ansible.builtin.debug:
         msg:
-          - "Drive URI: {{ item.item }}"
-          - "ID: {{ item.json.Id | default('N/A') }}"
-          - "Name: {{ item.json.Name | default('N/A') }}"
-          - "Model: {{ item.json.Model | default('N/A') }}"
-          - "SerialNumber: {{ item.json.SerialNumber | default('N/A') }}"
-          - "Protocol: {{ item.json.Protocol | default('N/A') }}"
-          - "MediaType: {{ item.json.MediaType | default('N/A') }}"
-          - "Capacity GiB: {{ ((item.json.CapacityBytes | default(0) | int) / 1073741824) | round(2) }}"
-          - "Health: {{ item.json.Status.Health | default('N/A') }}"
-          - "State: {{ item.json.Status.State | default('N/A') }}"
-          - "Identifiers: {{ item.json.Identifiers | default([]) }}"
-      loop: "{{ drives.results | default([]) }}"
-      when: item.skipped is not defined or not item.skipped
-      loop_control:
-        label: "{{ item.json.Id | default('drive') }}"
+          - "System URI: {{ system_uri }}"
+          - "Manufacturer: {{ system_info.json.Manufacturer | default('N/A') }}"
+          - "Model: {{ system_info.json.Model | default('N/A') }}"
+          - "SKU / NodeID: {{ system_info.json.SKU | default('N/A') }}"
+          - "SerialNumber: {{ system_info.json.SerialNumber | default('N/A') }}"
 
-    - name: Final read-only summary
-      ansible.builtin.debug:
-        msg:
+    - name: Read Storage collection
+      ansible.builtin.uri:
+        url: "{{ redfish_base }}{{ system_uri }}/Storage"
+        method: GET
+        user: "{{ idrac_username }}"
+        password: "{{ idrac_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ idrac_validate_certs }}"
+        return_content: true
+        status_code: 200
+      register: storage_collection
+      changed_when: false
+      no_log: true
+
+    - name: Validate Storage collection
+      ansible.builtin.assert:
+        that:
+          - storage_collection.json.Members is defined
+          - storage_collection.json.Members | length > 0
+        fail_msg: "No Redfish Storage resources were found."
+
+    - name: Read each storage resource
+      ansible.builtin.uri:
+        url: "{{ redfish_base }}{{ item['@odata.id'] }}"
