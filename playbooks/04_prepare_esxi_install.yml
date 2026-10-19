@@ -5,10 +5,13 @@
   become: true
 
   vars:
-    esxi_version_profile: "8.0u3-dell-a10"
+    # ESXi version/profile selected from the AAP Workflow Survey
+    esxi_version_profile: "{{ esxi_profile }}"
 
+    # Source boot.cfg belonging to the selected ESXi profile
     esxi_source_boot_cfg: "/opt/pxe/http/config/esxi/{{ esxi_version_profile }}/boot.cfg"
 
+    # Host-specific generated configuration
     esxi_generated_dir: "/opt/pxe/http/config/esxi/generated/{{ esxi_hostname }}"
     esxi_autoboot_dir: "/opt/pxe/http/config/autoboot"
 
@@ -16,30 +19,76 @@
     esxi_boot_cfg_path: "{{ esxi_generated_dir }}/boot.cfg"
     esxi_boot_ipxe_path: "{{ esxi_generated_dir }}/boot.ipxe"
 
+    # HTTP URLs used during PXE installation
     esxi_ks_url: "http://172.16.201.87/pxe/config/esxi/generated/{{ esxi_hostname }}/ks.cfg"
     esxi_boot_cfg_url: "http://172.16.201.87/pxe/config/esxi/generated/{{ esxi_hostname }}/boot.cfg"
+
+    # bootx64.efi is taken from the selected ESXi profile
     esxi_loader_url: "http://172.16.201.87/pxe/os/esxi/{{ esxi_version_profile }}/efi/boot/bootx64.efi"
 
+    # Injected from the AAP ESXi Root Password credential
     esxi_root_password: "{{ lookup('ansible.builtin.env', 'ESXI_ROOT_PASSWORD') }}"
 
   tasks:
+
     - name: Validate required ESXi variables
       ansible.builtin.assert:
         that:
+          - esxi_profile is defined
+          - esxi_profile | length > 0
+
           - esxi_hostname is defined
           - esxi_hostname | length > 0
+
           - esxi_ip is defined
           - esxi_ip | length > 0
+
           - esxi_netmask is defined
           - esxi_netmask | length > 0
+
           - esxi_gateway is defined
           - esxi_gateway | length > 0
+
           - esxi_dns is defined
           - esxi_dns | length > 0
+
           - esxi_install_disk is defined
           - esxi_install_disk | length > 0
+
           - esxi_root_password | length > 0
         fail_msg: "Missing required ESXi provisioning variables."
+        success_msg: "Required ESXi provisioning variables are present."
+
+    - name: Verify selected ESXi profile boot.cfg exists
+      ansible.builtin.stat:
+        path: "{{ esxi_source_boot_cfg }}"
+      register: esxi_profile_boot_cfg
+
+    - name: Validate selected ESXi profile
+      ansible.builtin.assert:
+        that:
+          - esxi_profile_boot_cfg.stat.exists
+          - esxi_profile_boot_cfg.stat.isreg | default(false)
+        fail_msg: >-
+          ESXi profile '{{ esxi_profile }}' does not exist
+          or boot.cfg is missing:
+          {{ esxi_source_boot_cfg }}
+        success_msg: "ESXi profile '{{ esxi_profile }}' is available."
+
+    - name: Verify selected ESXi boot loader exists
+      ansible.builtin.stat:
+        path: "/opt/pxe/http/os/esxi/{{ esxi_version_profile }}/efi/boot/bootx64.efi"
+      register: esxi_profile_loader
+
+    - name: Validate selected ESXi boot loader
+      ansible.builtin.assert:
+        that:
+          - esxi_profile_loader.stat.exists
+          - esxi_profile_loader.stat.isreg | default(false)
+        fail_msg: >-
+          ESXi profile '{{ esxi_profile }}' is missing bootx64.efi:
+          /opt/pxe/http/os/esxi/{{ esxi_version_profile }}/efi/boot/bootx64.efi
+        success_msg: "ESXi boot loader for profile '{{ esxi_profile }}' is available."
 
     - name: Create generated ESXi configuration directory
       ansible.builtin.file:
@@ -90,6 +139,7 @@
         content: |
           #!ipxe
           echo Starting automated ESXi installation for {{ esxi_hostname }}
+          echo ESXi profile: {{ esxi_profile }}
           imgfree
           kernel {{ esxi_loader_url }} -c {{ esxi_boot_cfg_url }}
           boot
@@ -121,11 +171,14 @@
     - name: Show generated ESXi configuration
       ansible.builtin.debug:
         msg:
+          - "ESXi profile: {{ esxi_profile }}"
           - "Hostname: {{ esxi_hostname }}"
           - "Management IP: {{ esxi_ip }}"
           - "Installation disk: {{ esxi_install_disk }}"
+          - "Source boot.cfg: {{ esxi_source_boot_cfg }}"
           - "Kickstart: {{ esxi_ks_path }}"
           - "Boot config: {{ esxi_boot_cfg_path }}"
           - "iPXE script: {{ esxi_boot_ipxe_path }}"
           - "Kickstart URL: {{ esxi_ks_url }}"
           - "Boot config URL: {{ esxi_boot_cfg_url }}"
+          - "ESXi loader URL: {{ esxi_loader_url }}"
