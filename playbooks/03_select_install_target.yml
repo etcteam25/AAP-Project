@@ -9,19 +9,26 @@
     idrac_validate_certs: false
     idrac_username: "{{ lookup('ansible.builtin.env', 'IDRAC_USERNAME') }}"
     idrac_password: "{{ lookup('ansible.builtin.env', 'IDRAC_PASSWORD') }}"
+    redfish_base: "https://{{ idrac_ip }}"
 
   tasks:
     - name: Validate required input
       ansible.builtin.assert:
         that:
           - idrac_ip is defined
+          - idrac_ip | string | length > 0
           - storage_profile is defined
-          - install_disk_selector is defined
           - storage_profile in ['standalone_nvme', 'raid1']
+          - install_disk_selector is defined
           - install_disk_selector in ['disk0', 'disk1', 'raid_virtual_disk']
-        fail_msg: "Provide idrac_ip, storage_profile and install_disk_selector."
+          - >
+            (storage_profile == 'standalone_nvme' and install_disk_selector in ['disk0', 'disk1']) or
+            (storage_profile == 'raid1' and install_disk_selector == 'raid_virtual_disk')
+        fail_msg: >-
+          Provide idrac_ip, storage_profile and a matching install_disk_selector.
+          standalone_nvme requires disk0/disk1; raid1 requires raid_virtual_disk.
 
-    - name: Gather Dell storage facts
+    - name: Gather standalone Dell storage facts
       ansible.builtin.include_role:
         name: dellemc.openmanage.idrac_gather_facts
       vars:
@@ -33,17 +40,19 @@
           - Controller
           - PhysicalDisk
           - VirtualDisk
+      when: storage_profile == 'standalone_nvme'
 
-    - name: Normalize discovered facts
+    - name: Normalize standalone discovered facts
       ansible.builtin.set_fact:
         discovered_controllers: "{{ controller | default([]) }}"
         discovered_physical_disks: "{{ physical_disk | default([]) }}"
         discovered_virtual_disks: "{{ virtual_disk | default([]) }}"
+      when: storage_profile == 'standalone_nvme'
 
     - name: Select standalone Disk 0
       ansible.builtin.set_fact:
         selected_install_disk: "{{ item }}"
-      loop: "{{ discovered_physical_disks }}"
+      loop: "{{ discovered_physical_disks | default([]) }}"
       when:
         - storage_profile == 'standalone_nvme'
         - install_disk_selector == 'disk0'
@@ -52,41 +61,292 @@
     - name: Select standalone Disk 1
       ansible.builtin.set_fact:
         selected_install_disk: "{{ item }}"
-      loop: "{{ discovered_physical_disks }}"
+      loop: "{{ discovered_physical_disks | default([]) }}"
       when:
         - storage_profile == 'standalone_nvme'
         - install_disk_selector == 'disk1'
         - item.Id is search('-1$')
 
-    - name: Stop RAID target selection until RAID hardware is discovered
-      ansible.builtin.fail:
-        msg: >-
-          RAID target selection is intentionally not enabled yet.
-          We will build it after discovering the actual RAID1/PERC layout
-          in the on-prem environment.
-      when:
-        - storage_profile == 'raid1'
-
     - name: Validate selected standalone disk
       ansible.builtin.assert:
         that:
           - selected_install_disk is defined
-          - selected_install_disk.Status.Health == 'OK'
-          - not selected_install_disk.FailurePredicted
-        fail_msg: "Selected disk is missing or unhealthy."
-        success_msg: "Installation target validation PASSED."
-      when:
-        - storage_profile == 'standalone_nvme'
+          - selected_install_disk.Status.Health | default('') == 'OK'
+          - not (selected_install_disk.FailurePredicted | default(false) | bool)
+          - esxi_install_disk is defined
+          - esxi_install_disk | string | trim | length > 0
+        fail_msg: >-
+          Selected standalone disk is missing/unhealthy or esxi_install_disk
+          (the ESXi-visible T10/NAA identifier) was not supplied.
+        success_msg: "Standalone installation target validation PASSED."
+      when: storage_profile == 'standalone_nvme'
 
-    - name: Show selected installation target
+    - name: Resolve standalone ESXi installation target
+      ansible.builtin.set_fact:
+        resolved_esxi_install_mode: "disk"
+        resolved_esxi_install_target: "{{ esxi_install_disk | trim }}"
+        resolved_storage_target_id: "{{ selected_install_disk.Id }}"
+        resolved_storage_target_name: "{{ selected_install_disk.Name | default(selected_install_disk.Id) }}"
+      when: storage_profile == 'standalone_nvme'
+
+    - name: Show selected standalone installation target
       ansible.builtin.debug:
         msg:
-          id: "{{ selected_install_disk.Id }}"
+          redfish_id: "{{ selected_install_disk.Id }}"
           name: "{{ selected_install_disk.Name }}"
           model: "{{ selected_install_disk.Model }}"
           serial: "{{ selected_install_disk.SerialNumber }}"
           capacity_bytes: "{{ selected_install_disk.CapacityBytes }}"
           health: "{{ selected_install_disk.Status.Health }}"
           failure_predicted: "{{ selected_install_disk.FailurePredicted }}"
+          esxi_install_mode: "{{ resolved_esxi_install_mode }}"
+          esxi_install_target: "{{ resolved_esxi_install_target }}"
+      when: storage_profile == 'standalone_nvme'
+
+    - name: Read Redfish Systems collection for RAID1 target selection
+      ansible.builtin.uri:
+        url: "{{ redfish_base }}/redfish/v1/Systems"
+        method: GET
+        user: "{{ idrac_username }}"
+        password: "{{ idrac_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ idrac_validate_certs }}"
+        return_content: true
+        status_code: 200
+      register: raid_systems_collection
+      changed_when: false
+      no_log: true
+      when: storage_profile == 'raid1'
+
+    - name: Validate Redfish system discovery for RAID1 target
+      ansible.builtin.assert:
+        that:
+          - raid_systems_collection.json.Members is defined
+          - raid_systems_collection.json.Members | length > 0
+        fail_msg: "No Redfish ComputerSystem was returned by iDRAC."
+      when: storage_profile == 'raid1'
+
+    - name: Save Redfish system URI for RAID1 target
+      ansible.builtin.set_fact:
+        raid_system_uri: "{{ raid_systems_collection.json.Members[0]['@odata.id'] }}"
+      when: storage_profile == 'raid1'
+
+    - name: Read Redfish Storage collection for RAID1 target
+      ansible.builtin.uri:
+        url: "{{ redfish_base }}{{ raid_system_uri }}/Storage"
+        method: GET
+        user: "{{ idrac_username }}"
+        password: "{{ idrac_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ idrac_validate_certs }}"
+        return_content: true
+        status_code: 200
+      register: raid_storage_collection
+      changed_when: false
+      no_log: true
+      when: storage_profile == 'raid1'
+
+    - name: Initialize RAID storage URI list
+      ansible.builtin.set_fact:
+        raid_storage_uris: []
+      when: storage_profile == 'raid1'
+
+    - name: Collect RAID storage resource URIs
+      ansible.builtin.set_fact:
+        raid_storage_uris: "{{ raid_storage_uris + [raid_storage_member['@odata.id']] }}"
+      loop: "{{ raid_storage_collection.json.Members | default([]) }}"
+      loop_control:
+        loop_var: raid_storage_member
+        label: "{{ raid_storage_member['@odata.id'] | default('unknown-storage-member') }}"
       when:
-        - storage_profile == 'standalone_nvme'
+        - storage_profile == 'raid1'
+        - raid_storage_member['@odata.id'] is defined
+
+    - name: Read RAID storage resources
+      ansible.builtin.uri:
+        url: "{{ redfish_base }}{{ raid_storage_uri }}"
+        method: GET
+        user: "{{ idrac_username }}"
+        password: "{{ idrac_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ idrac_validate_certs }}"
+        return_content: true
+        status_code: 200
+      loop: "{{ raid_storage_uris | default([]) }}"
+      loop_control:
+        loop_var: raid_storage_uri
+        label: "{{ raid_storage_uri }}"
+      register: raid_storage_results
+      changed_when: false
+      no_log: true
+      when: storage_profile == 'raid1'
+
+    - name: Initialize BOSS-N1 candidate list
+      ansible.builtin.set_fact:
+        boss_storage_candidates: []
+      when: storage_profile == 'raid1'
+
+    - name: Collect BOSS-N1 storage candidates
+      ansible.builtin.set_fact:
+        boss_storage_candidates: "{{ boss_storage_candidates + [raid_storage_result.json] }}"
+      loop: "{{ raid_storage_results.results | default([]) }}"
+      loop_control:
+        loop_var: raid_storage_result
+        label: "{{ raid_storage_result.json.Id | default('storage') }}"
+      when:
+        - storage_profile == 'raid1'
+        - >
+          ('BOSS-N1' in (raid_storage_result.json.Name | default(''))) or
+          ((raid_storage_result.json.Id | default('')) is search('^BOSS\\.'))
+
+    - name: Validate exactly one supported BOSS-N1 controller
+      ansible.builtin.assert:
+        that:
+          - boss_storage_candidates | length == 1
+          - "'BOSS-N1' in (boss_storage_candidates[0].Name | default(''))"
+          - boss_storage_candidates[0].Status.Health | default('') == 'OK'
+          - boss_storage_candidates[0].Status.State | default('') == 'Enabled'
+          - boss_storage_candidates[0].Volumes is defined
+          - boss_storage_candidates[0].Volumes['@odata.id'] is defined
+        fail_msg: >-
+          RAID target selection FAILED.
+          Expected exactly one healthy/enabled BOSS-N1 controller.
+          Arbitrary PERC RAID volumes are intentionally not eligible.
+      when: storage_profile == 'raid1'
+
+    - name: Save BOSS-N1 volume collection URI
+      ansible.builtin.set_fact:
+        boss_volume_collection_uri: "{{ boss_storage_candidates[0].Volumes['@odata.id'] }}"
+      when: storage_profile == 'raid1'
+
+    - name: Read BOSS-N1 volume collection
+      ansible.builtin.uri:
+        url: "{{ redfish_base }}{{ boss_volume_collection_uri }}"
+        method: GET
+        user: "{{ idrac_username }}"
+        password: "{{ idrac_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ idrac_validate_certs }}"
+        return_content: true
+        status_code: 200
+      register: boss_volume_collection
+      changed_when: false
+      no_log: true
+      when: storage_profile == 'raid1'
+
+    - name: Initialize BOSS volume URI list
+      ansible.builtin.set_fact:
+        boss_volume_uris: []
+      when: storage_profile == 'raid1'
+
+    - name: Collect BOSS virtual disk URIs
+      ansible.builtin.set_fact:
+        boss_volume_uris: "{{ boss_volume_uris + [boss_volume_member['@odata.id']] }}"
+      loop: "{{ boss_volume_collection.json.Members | default([]) }}"
+      loop_control:
+        loop_var: boss_volume_member
+        label: "{{ boss_volume_member['@odata.id'] | default('unknown-volume-member') }}"
+      when:
+        - storage_profile == 'raid1'
+        - boss_volume_member['@odata.id'] is defined
+
+    - name: Read BOSS virtual disks
+      ansible.builtin.uri:
+        url: "{{ redfish_base }}{{ boss_volume_uri }}"
+        method: GET
+        user: "{{ idrac_username }}"
+        password: "{{ idrac_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ idrac_validate_certs }}"
+        return_content: true
+        status_code: 200
+      loop: "{{ boss_volume_uris | default([]) }}"
+      loop_control:
+        loop_var: boss_volume_uri
+        label: "{{ boss_volume_uri }}"
+      register: boss_volume_results
+      changed_when: false
+      no_log: true
+      when: storage_profile == 'raid1'
+
+    - name: Initialize BOSS RAID1 candidate list
+      ansible.builtin.set_fact:
+        boss_raid1_candidates: []
+      when: storage_profile == 'raid1'
+
+    - name: Collect BOSS RAID1 virtual disks
+      ansible.builtin.set_fact:
+        boss_raid1_candidates: "{{ boss_raid1_candidates + [boss_volume_result.json] }}"
+      loop: "{{ boss_volume_results.results | default([]) }}"
+      loop_control:
+        loop_var: boss_volume_result
+        label: "{{ boss_volume_result.json.Name | default(boss_volume_result.json.Id | default('volume')) }}"
+      when:
+        - storage_profile == 'raid1'
+        - (boss_volume_result.json.RAIDType | default('') | upper) == 'RAID1'
+
+    - name: Validate BOSS-N1 RAID1 target
+      ansible.builtin.assert:
+        that:
+          - boss_raid1_candidates | length == 1
+          - boss_raid1_candidates[0].Status.Health | default('') == 'OK'
+          - boss_raid1_candidates[0].Status.State | default('') == 'Enabled'
+          - boss_raid1_candidates[0].Links is defined
+          - boss_raid1_candidates[0].Links.Drives | default([]) | length == 2
+        fail_msg: >-
+          RAID target selection FAILED.
+          Expected exactly one healthy/enabled BOSS-N1 RAID1 virtual disk
+          backed by exactly two drives.
+        success_msg: "BOSS-N1 RAID1 installation target validation PASSED."
+      when: storage_profile == 'raid1'
+
+    - name: Resolve BOSS-N1 ESXi installation target
+      ansible.builtin.set_fact:
+        resolved_esxi_install_mode: "firstdisk"
+        resolved_esxi_install_target: 'DELL\ BOSS-N1'
+        resolved_storage_target_id: "{{ boss_raid1_candidates[0].Id }}"
+        resolved_storage_target_name: "{{ boss_raid1_candidates[0].Name | trim }}"
+      when: storage_profile == 'raid1'
+
+    - name: Show selected BOSS-N1 installation target
+      ansible.builtin.debug:
+        msg:
+          controller_id: "{{ boss_storage_candidates[0].Id }}"
+          controller_name: "{{ boss_storage_candidates[0].Name }}"
+          virtual_disk_id: "{{ resolved_storage_target_id }}"
+          virtual_disk_name: "{{ resolved_storage_target_name }}"
+          raid_type: "{{ boss_raid1_candidates[0].RAIDType }}"
+          health: "{{ boss_raid1_candidates[0].Status.Health }}"
+          linked_drive_count: "{{ boss_raid1_candidates[0].Links.Drives | length }}"
+          esxi_install_mode: "{{ resolved_esxi_install_mode }}"
+          esxi_install_target: "{{ resolved_esxi_install_target }}"
+      when: storage_profile == 'raid1'
+
+    - name: Validate resolved ESXi install target
+      ansible.builtin.assert:
+        that:
+          - resolved_esxi_install_mode is defined
+          - resolved_esxi_install_mode in ['disk', 'firstdisk']
+          - resolved_esxi_install_target is defined
+          - resolved_esxi_install_target | string | length > 0
+        fail_msg: "Failed to resolve a safe ESXi installation target."
+
+    - name: Publish ESXi installation target to downstream workflow jobs
+      ansible.builtin.set_stats:
+        data:
+          esxi_install_mode: "{{ resolved_esxi_install_mode }}"
+          esxi_install_target: "{{ resolved_esxi_install_target }}"
+          esxi_storage_target_id: "{{ resolved_storage_target_id }}"
+          esxi_storage_target_name: "{{ resolved_storage_target_name }}"
+        per_host: false
+        aggregate: true
+
+    - name: Show workflow target artifact
+      ansible.builtin.debug:
+        msg:
+          storage_profile: "{{ storage_profile }}"
+          install_disk_selector: "{{ install_disk_selector }}"
+          esxi_install_mode: "{{ resolved_esxi_install_mode }}"
+          esxi_install_target: "{{ resolved_esxi_install_target }}"
+          esxi_storage_target_id: "{{ resolved_storage_target_id }}"
+          esxi_storage_target_name: "{{ resolved_storage_target_name }}"

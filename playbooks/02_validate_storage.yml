@@ -9,6 +9,7 @@
     idrac_validate_certs: false
     idrac_username: "{{ lookup('ansible.builtin.env', 'IDRAC_USERNAME') }}"
     idrac_password: "{{ lookup('ansible.builtin.env', 'IDRAC_PASSWORD') }}"
+    redfish_base: "https://{{ idrac_ip }}"
 
   tasks:
     - name: Validate required input
@@ -20,7 +21,7 @@
           - storage_profile in ['standalone_nvme', 'raid1']
         fail_msg: "Provide idrac_ip and a valid storage_profile."
 
-    - name: Gather storage facts from iDRAC
+    - name: Gather standalone NVMe storage facts from iDRAC
       ansible.builtin.include_role:
         name: dellemc.openmanage.idrac_gather_facts
       vars:
@@ -33,23 +34,25 @@
           - Controller
           - PhysicalDisk
           - VirtualDisk
+      when: storage_profile == 'standalone_nvme'
 
-    - name: Normalize discovered facts
+    - name: Normalize standalone NVMe facts
       ansible.builtin.set_fact:
         discovered_controllers: "{{ controller | default([]) }}"
         discovered_physical_disks: "{{ physical_disk | default([]) }}"
         discovered_virtual_disks: "{{ virtual_disk | default([]) }}"
+      when: storage_profile == 'standalone_nvme'
 
-    - name: Show discovered storage summary
+    - name: Show standalone NVMe storage summary
       ansible.builtin.debug:
         msg:
           - "Requested profile: {{ storage_profile }}"
           - "Controllers found: {{ discovered_controllers | length }}"
           - "Physical disks found: {{ discovered_physical_disks | length }}"
           - "Virtual disks found: {{ discovered_virtual_disks | length }}"
+      when: storage_profile == 'standalone_nvme'
 
     - name: Validate standalone NVMe profile
-      when: storage_profile == 'standalone_nvme'
       ansible.builtin.assert:
         that:
           - discovered_physical_disks | length > 0
@@ -58,44 +61,9 @@
         fail_msg: >-
           Standalone NVMe validation FAILED.
           Expected physical disks with no RAID controller.
+      when: storage_profile == 'standalone_nvme'
 
-    - name: Validate RAID1 profile - basic discovery
-      when: storage_profile == 'raid1'
-      ansible.builtin.assert:
-        that:
-          - discovered_controllers | length > 0
-          - discovered_physical_disks | length >= 2
-          - discovered_virtual_disks | length > 0
-        success_msg: "Basic RAID storage discovery PASSED."
-        fail_msg: >-
-          RAID1 validation FAILED.
-          Expected a RAID controller, at least two physical disks,
-          and at least one virtual disk.
-
-    - name: Show physical disk IDs
-      ansible.builtin.debug:
-        msg: >-
-          Disk={{ item.Id | default('UNKNOWN') }}
-          Model={{ item.Model | default('UNKNOWN') }}
-          Serial={{ item.SerialNumber | default('UNKNOWN') }}
-          Capacity={{ item.CapacityBytes | default('UNKNOWN') }}
-          FailurePredicted={{ item.FailurePredicted | default('UNKNOWN') }}
-      loop: "{{ discovered_physical_disks }}"
-
-    - name: Show virtual disk IDs
-      ansible.builtin.debug:
-        msg: >-
-          VirtualDisk={{ item.Id | default('UNKNOWN') }}
-          Name={{ item.Name | default('UNKNOWN') }}
-          Capacity={{ item.CapacityBytes | default('UNKNOWN') }}
-      loop: "{{ discovered_virtual_disks }}"
-
-    - name: Final validation result
-      ansible.builtin.debug:
-        msg: "Storage validation completed successfully for {{ idrac_ip }}."
-        
-        
-    - name: Show physical disk inventory for provisioning
+    - name: Show standalone physical disk inventory
       ansible.builtin.debug:
         msg:
           id: "{{ item.Id | default('UNKNOWN') }}"
@@ -104,5 +72,222 @@
           serial: "{{ item.SerialNumber | default(item.Oem.Dell.DellPCIeSSD.SerialNumber | default('UNKNOWN')) }}"
           media_type: "{{ item.MediaType | default('UNKNOWN') }}"
           capacity_bytes: "{{ item.CapacityBytes | default('UNKNOWN') }}"
+          health: "{{ item.Status.Health | default('UNKNOWN') }}"
           failure_predicted: "{{ item.FailurePredicted | default('UNKNOWN') }}"
-      loop: "{{ discovered_physical_disks }}"
+      loop: "{{ discovered_physical_disks | default([]) }}"
+      when: storage_profile == 'standalone_nvme'
+
+    - name: Read Redfish Systems collection for RAID1 validation
+      ansible.builtin.uri:
+        url: "{{ redfish_base }}/redfish/v1/Systems"
+        method: GET
+        user: "{{ idrac_username }}"
+        password: "{{ idrac_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ idrac_validate_certs }}"
+        return_content: true
+        status_code: 200
+      register: raid_systems_collection
+      changed_when: false
+      no_log: true
+      when: storage_profile == 'raid1'
+
+    - name: Validate Redfish system discovery for RAID1
+      ansible.builtin.assert:
+        that:
+          - raid_systems_collection.json.Members is defined
+          - raid_systems_collection.json.Members | length > 0
+        fail_msg: "No Redfish ComputerSystem was returned by iDRAC."
+      when: storage_profile == 'raid1'
+
+    - name: Save Redfish system URI for RAID1
+      ansible.builtin.set_fact:
+        raid_system_uri: "{{ raid_systems_collection.json.Members[0]['@odata.id'] }}"
+      when: storage_profile == 'raid1'
+
+    - name: Read Redfish Storage collection for RAID1
+      ansible.builtin.uri:
+        url: "{{ redfish_base }}{{ raid_system_uri }}/Storage"
+        method: GET
+        user: "{{ idrac_username }}"
+        password: "{{ idrac_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ idrac_validate_certs }}"
+        return_content: true
+        status_code: 200
+      register: raid_storage_collection
+      changed_when: false
+      no_log: true
+      when: storage_profile == 'raid1'
+
+    - name: Initialize RAID storage URI list
+      ansible.builtin.set_fact:
+        raid_storage_uris: []
+      when: storage_profile == 'raid1'
+
+    - name: Collect RAID storage resource URIs
+      ansible.builtin.set_fact:
+        raid_storage_uris: "{{ raid_storage_uris + [raid_storage_member['@odata.id']] }}"
+      loop: "{{ raid_storage_collection.json.Members | default([]) }}"
+      loop_control:
+        loop_var: raid_storage_member
+        label: "{{ raid_storage_member['@odata.id'] | default('unknown-storage-member') }}"
+      when:
+        - storage_profile == 'raid1'
+        - raid_storage_member['@odata.id'] is defined
+
+    - name: Read RAID storage resources
+      ansible.builtin.uri:
+        url: "{{ redfish_base }}{{ raid_storage_uri }}"
+        method: GET
+        user: "{{ idrac_username }}"
+        password: "{{ idrac_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ idrac_validate_certs }}"
+        return_content: true
+        status_code: 200
+      loop: "{{ raid_storage_uris | default([]) }}"
+      loop_control:
+        loop_var: raid_storage_uri
+        label: "{{ raid_storage_uri }}"
+      register: raid_storage_results
+      changed_when: false
+      no_log: true
+      when: storage_profile == 'raid1'
+
+    - name: Initialize BOSS-N1 candidate list
+      ansible.builtin.set_fact:
+        boss_storage_candidates: []
+      when: storage_profile == 'raid1'
+
+    - name: Collect BOSS-N1 storage candidates
+      ansible.builtin.set_fact:
+        boss_storage_candidates: "{{ boss_storage_candidates + [raid_storage_result.json] }}"
+      loop: "{{ raid_storage_results.results | default([]) }}"
+      loop_control:
+        loop_var: raid_storage_result
+        label: "{{ raid_storage_result.json.Id | default('storage') }}"
+      when:
+        - storage_profile == 'raid1'
+        - >
+          ('BOSS-N1' in (raid_storage_result.json.Name | default(''))) or
+          ((raid_storage_result.json.Id | default('')) is search('^BOSS\\.'))
+
+    - name: Validate exactly one BOSS-N1 controller
+      ansible.builtin.assert:
+        that:
+          - boss_storage_candidates | length == 1
+          - "'BOSS-N1' in (boss_storage_candidates[0].Name | default(''))"
+          - boss_storage_candidates[0].Status.Health | default('') == 'OK'
+          - boss_storage_candidates[0].Status.State | default('') == 'Enabled'
+          - boss_storage_candidates[0].Volumes is defined
+          - boss_storage_candidates[0].Volumes['@odata.id'] is defined
+        fail_msg: >-
+          RAID1 validation FAILED.
+          Expected exactly one healthy/enabled Dell BOSS-N1 controller with a Volumes link.
+          This automation intentionally does not treat arbitrary PERC RAID1 volumes as the ESXi OS target.
+      when: storage_profile == 'raid1'
+
+    - name: Save BOSS-N1 volume collection URI
+      ansible.builtin.set_fact:
+        boss_volume_collection_uri: "{{ boss_storage_candidates[0].Volumes['@odata.id'] }}"
+      when: storage_profile == 'raid1'
+
+    - name: Read BOSS-N1 volume collection
+      ansible.builtin.uri:
+        url: "{{ redfish_base }}{{ boss_volume_collection_uri }}"
+        method: GET
+        user: "{{ idrac_username }}"
+        password: "{{ idrac_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ idrac_validate_certs }}"
+        return_content: true
+        status_code: 200
+      register: boss_volume_collection
+      changed_when: false
+      no_log: true
+      when: storage_profile == 'raid1'
+
+    - name: Initialize BOSS volume URI list
+      ansible.builtin.set_fact:
+        boss_volume_uris: []
+      when: storage_profile == 'raid1'
+
+    - name: Collect BOSS virtual disk URIs
+      ansible.builtin.set_fact:
+        boss_volume_uris: "{{ boss_volume_uris + [boss_volume_member['@odata.id']] }}"
+      loop: "{{ boss_volume_collection.json.Members | default([]) }}"
+      loop_control:
+        loop_var: boss_volume_member
+        label: "{{ boss_volume_member['@odata.id'] | default('unknown-volume-member') }}"
+      when:
+        - storage_profile == 'raid1'
+        - boss_volume_member['@odata.id'] is defined
+
+    - name: Read BOSS virtual disks
+      ansible.builtin.uri:
+        url: "{{ redfish_base }}{{ boss_volume_uri }}"
+        method: GET
+        user: "{{ idrac_username }}"
+        password: "{{ idrac_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ idrac_validate_certs }}"
+        return_content: true
+        status_code: 200
+      loop: "{{ boss_volume_uris | default([]) }}"
+      loop_control:
+        loop_var: boss_volume_uri
+        label: "{{ boss_volume_uri }}"
+      register: boss_volume_results
+      changed_when: false
+      no_log: true
+      when: storage_profile == 'raid1'
+
+    - name: Initialize BOSS RAID1 candidate list
+      ansible.builtin.set_fact:
+        boss_raid1_candidates: []
+      when: storage_profile == 'raid1'
+
+    - name: Collect BOSS RAID1 virtual disks
+      ansible.builtin.set_fact:
+        boss_raid1_candidates: "{{ boss_raid1_candidates + [boss_volume_result.json] }}"
+      loop: "{{ boss_volume_results.results | default([]) }}"
+      loop_control:
+        loop_var: boss_volume_result
+        label: "{{ boss_volume_result.json.Name | default(boss_volume_result.json.Id | default('volume')) }}"
+      when:
+        - storage_profile == 'raid1'
+        - (boss_volume_result.json.RAIDType | default('') | upper) == 'RAID1'
+
+    - name: Validate BOSS-N1 RAID1 OS volume
+      ansible.builtin.assert:
+        that:
+          - boss_raid1_candidates | length == 1
+          - boss_raid1_candidates[0].Status.Health | default('') == 'OK'
+          - boss_raid1_candidates[0].Status.State | default('') == 'Enabled'
+          - boss_raid1_candidates[0].Links is defined
+          - boss_raid1_candidates[0].Links.Drives | default([]) | length == 2
+        success_msg: "BOSS-N1 RAID1 storage validation PASSED."
+        fail_msg: >-
+          RAID1 validation FAILED.
+          Expected exactly one healthy/enabled RAID1 virtual disk on BOSS-N1,
+          backed by exactly two physical drives.
+      when: storage_profile == 'raid1'
+
+    - name: Show validated BOSS-N1 RAID1 target
+      ansible.builtin.debug:
+        msg:
+          controller_id: "{{ boss_storage_candidates[0].Id }}"
+          controller_name: "{{ boss_storage_candidates[0].Name }}"
+          virtual_disk_id: "{{ boss_raid1_candidates[0].Id }}"
+          virtual_disk_name: "{{ boss_raid1_candidates[0].Name | trim }}"
+          raid_type: "{{ boss_raid1_candidates[0].RAIDType }}"
+          health: "{{ boss_raid1_candidates[0].Status.Health }}"
+          state: "{{ boss_raid1_candidates[0].Status.State }}"
+          linked_drive_count: "{{ boss_raid1_candidates[0].Links.Drives | length }}"
+          esxi_selector: 'DELL\ BOSS-N1'
+      when: storage_profile == 'raid1'
+
+    - name: Final validation result
+      ansible.builtin.debug:
+        msg: "Storage validation completed successfully for {{ idrac_ip }}."

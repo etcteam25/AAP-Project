@@ -5,58 +5,52 @@
   become: true
 
   vars:
-    # ESXi version/profile selected from the AAP Workflow Survey
     esxi_version_profile: "{{ esxi_profile }}"
-
-    # Source boot.cfg belonging to the selected ESXi profile
     esxi_source_boot_cfg: "/opt/pxe/http/config/esxi/{{ esxi_version_profile }}/boot.cfg"
-
-    # Host-specific generated configuration
     esxi_generated_dir: "/opt/pxe/http/config/esxi/generated/{{ esxi_hostname }}"
     esxi_autoboot_dir: "/opt/pxe/http/config/autoboot"
-
     esxi_ks_path: "{{ esxi_generated_dir }}/ks.cfg"
     esxi_boot_cfg_path: "{{ esxi_generated_dir }}/boot.cfg"
     esxi_boot_ipxe_path: "{{ esxi_generated_dir }}/boot.ipxe"
-
-    # HTTP URLs used during PXE installation
     esxi_ks_url: "http://172.16.201.87/pxe/config/esxi/generated/{{ esxi_hostname }}/ks.cfg"
     esxi_boot_cfg_url: "http://172.16.201.87/pxe/config/esxi/generated/{{ esxi_hostname }}/boot.cfg"
-
-    # bootx64.efi is taken from the selected ESXi profile
     esxi_loader_url: "http://172.16.201.87/pxe/os/esxi/{{ esxi_version_profile }}/efi/boot/bootx64.efi"
-
-    # Injected from the AAP ESXi Root Password credential
     esxi_root_password: "{{ lookup('ansible.builtin.env', 'ESXI_ROOT_PASSWORD') }}"
 
   tasks:
-
     - name: Validate required ESXi variables
       ansible.builtin.assert:
         that:
           - esxi_profile is defined
           - esxi_profile | length > 0
-
+          - storage_profile is defined
+          - storage_profile in ['standalone_nvme', 'raid1']
+          - esxi_install_mode is defined
+          - esxi_install_mode in ['disk', 'firstdisk']
+          - esxi_install_target is defined
+          - esxi_install_target | string | length > 0
+          - >
+            (storage_profile == 'standalone_nvme' and esxi_install_mode == 'disk') or
+            (storage_profile == 'raid1' and esxi_install_mode == 'firstdisk')
+          - >
+            (esxi_install_mode != 'firstdisk') or
+            (esxi_install_target == 'DELL\ BOSS-N1')
           - esxi_hostname is defined
           - esxi_hostname | length > 0
-
           - esxi_ip is defined
           - esxi_ip | length > 0
-
           - esxi_netmask is defined
           - esxi_netmask | length > 0
-
           - esxi_gateway is defined
           - esxi_gateway | length > 0
-
           - esxi_dns is defined
           - esxi_dns | length > 0
-
-          - esxi_install_disk is defined
-          - esxi_install_disk | length > 0
-
           - esxi_root_password | length > 0
-        fail_msg: "Missing required ESXi provisioning variables."
+        fail_msg: >-
+          Missing or inconsistent ESXi provisioning variables.
+          The install target must come from Job 03:
+          standalone_nvme -> mode=disk;
+          raid1 -> mode=firstdisk,target=DELL\ BOSS-N1.
         success_msg: "Required ESXi provisioning variables are present."
 
     - name: Verify selected ESXi profile boot.cfg exists
@@ -140,6 +134,8 @@
           #!ipxe
           echo Starting automated ESXi installation for {{ esxi_hostname }}
           echo ESXi profile: {{ esxi_profile }}
+          echo Storage profile: {{ storage_profile }}
+          echo ESXi install mode: {{ esxi_install_mode }}
           imgfree
           kernel {{ esxi_loader_url }} -c {{ esxi_boot_cfg_url }}
           boot
@@ -172,9 +168,13 @@
       ansible.builtin.debug:
         msg:
           - "ESXi profile: {{ esxi_profile }}"
+          - "Storage profile: {{ storage_profile }}"
           - "Hostname: {{ esxi_hostname }}"
           - "Management IP: {{ esxi_ip }}"
-          - "Installation disk: {{ esxi_install_disk }}"
+          - "Installation mode: {{ esxi_install_mode }}"
+          - "Installation target: {{ esxi_install_target }}"
+          - "Storage target ID: {{ esxi_storage_target_id | default('N/A') }}"
+          - "Storage target name: {{ esxi_storage_target_name | default('N/A') }}"
           - "Source boot.cfg: {{ esxi_source_boot_cfg }}"
           - "Kickstart: {{ esxi_ks_path }}"
           - "Boot config: {{ esxi_boot_cfg_path }}"
